@@ -2,7 +2,7 @@ use std::time;
 
 use model::{ActiveModelTrait, EntityTrait, ModelTrait, Set, Unchanged};
 use proxy::{self};
-use tokio::{self, runtime, sync::mpsc, task::JoinHandle};
+use tokio::{self, runtime};
 
 use crate::{
     event::Event,
@@ -10,16 +10,26 @@ use crate::{
     CreateGateInput, UpdateGateInput,
 };
 
-/// a porter should live for as long as the main program and be used in the following order
-///
-/// program start => new() => start() => program end
+/// Porter is an application converting remote services to local ones by proxying the
+/// local requests so that the remote service is seen as a local service.
 pub struct Porter {
     proxy_manager: proxy::ProxyManager,
     db: model::Database,
 }
 
 impl Porter {
-    /// create a new porter
+    /// Create a new porter. A database connection and a proxy manager(something running in background)
+    /// are created before return.
+    ///
+    /// There are 2 types of major entities: Service and Gate.
+    ///
+    /// - **Service:** the remote service where the local requests should be directed to.
+    /// - **Gate:** the local interface where the requests comes from. e.g. 127.0.0.1:8080 .
+    ///
+    /// Normally an application only needs 1 instance. But porter does not support lifecycle control, meaning
+    /// it cannot be manually started after instantiation nor manually stopped. The only way to control it
+    /// is dropping it, causing termination of the resources it contains. In order to restart a
+    /// stopped/terminated/broken porter, a new instance should be created following the drop of the old one.
     pub fn new() -> Self {
         let async_handler = runtime::Handle::current();
         let proxy_manager = proxy::ProxyManager::new();
@@ -35,10 +45,12 @@ impl Porter {
         }
     }
 
+    /// Shows all services defined.
     pub async fn list_service(&self) -> Result<Vec<model::service::Model>, Error> {
         Ok(model::service::Entity::find().all(self.get_db()?).await?)
     }
 
+    /// Returns a service specified by its id, Error if not found.
     pub async fn get_service(&self, id: i32) -> Result<model::service::Model, Error> {
         Ok(model::service::Entity::find_by_id(id)
             .one(self.get_db()?)
@@ -46,6 +58,7 @@ impl Porter {
             .ok_or(format!("service {} not found", id))?)
     }
 
+    /// Create a service.
     pub async fn create_service(
         &self,
         input: CreateServiceInput,
@@ -53,6 +66,8 @@ impl Porter {
         Ok(input.into_active_model().insert(self.get_db()?).await?)
     }
 
+    /// Update a service. Noting that by updating a service the related gates
+    /// are not automatically updated to the new service.
     pub async fn update_service(
         &self,
         id: i32,
@@ -64,6 +79,7 @@ impl Porter {
         Ok(update.update(self.get_db()?).await?)
     }
 
+    /// Delete a service.
     pub async fn delete_service(&self, id: i32) -> Result<(), Error> {
         Ok(model::service::Entity::find_by_id(id)
             .one(self.get_db()?)
@@ -74,15 +90,18 @@ impl Porter {
             .map(|_| ())?)
     }
 
+    /// Shows all gates defined.
+    /// DOING: async map(stream)
     pub async fn list_gate(&self) -> Result<Vec<model::gate::Model>, Error> {
         let gates = model::gate::Entity::find()
             .all(self.get_db()?)
             .await?
             .iter_mut()
-            .map(|gate| {
-                gate.status = self.get_gate_status(gate);
+            .map(|gate| async {
+                gate.ready = self.proxy_manager.proxy_ready(gate.port).await;
                 gate.to_owned()
             })
+            .await
             .collect();
         Ok(gates)
     }
@@ -92,7 +111,7 @@ impl Porter {
             .one(self.get_db()?)
             .await?
             .ok_or(format!("gate {} not found", id))?;
-        gate.status = self.get_gate_status(&gate);
+        gate.ready = self.get_gate_status(&gate);
         Ok(gate)
     }
 

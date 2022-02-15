@@ -8,6 +8,8 @@ use tokio::{
 use super::proxy::Proxy;
 use crate::types::{Error, Request, Response};
 
+/// A TCP proxy connecting local ports to remote addresses.
+/// Currently only 1-to-1 relation is supported, i.e. no loadbalancing.
 pub struct ProxyManager {
     sender: mpsc::Sender<Request>,
     daemon: JoinHandle<()>,
@@ -19,8 +21,14 @@ impl ProxyManager {
         "proxy manager request cannot be sent, program is likely broken";
     const PROXY_NOT_READY: &'static str = "proxy not ready";
     const PROXY_ALREADY_STARTED: &'static str = "proxy already started";
+    const MANAGER_TERMINATING: &'static str = "proxy manager is terminating";
     const REQUEST_TIMEOUT: time::Duration = time::Duration::from_secs(5);
 
+    /// Create a new Proxy Manager.
+    ///
+    /// A background async task is created and kept running until the instance is dropped.
+    ///
+    /// This method MUST be called within a tokio runtime!!!
     pub fn new() -> Self {
         let (sender, mut receiver) = mpsc::channel::<Request>(8);
         let req_sender = sender.clone();
@@ -30,8 +38,10 @@ impl ProxyManager {
             ready_watcher: ready_receiver,
             daemon: tokio::spawn(async move {
                 let mut proxy_map = HashMap::<i32, Proxy>::new();
+                let mut watcher_map = HashMap::<i32, JoinHandle<()>>::new();
+                let mut terminating = false;
                 ready_sender.send(true).unwrap();
-                while let Some(ev) = receiver.recv().await {
+                'ev_loop: while let Some(ev) = receiver.recv().await {
                     match ev {
                         Request::ProxyStatus(port, res) => {
                             if proxy_map.contains_key(&port) {
@@ -46,6 +56,12 @@ impl ProxyManager {
                             remote_addr,
                             response_channel,
                         } => {
+                            if terminating {
+                                response_channel
+                                    .send(Err(ProxyManager::MANAGER_TERMINATING.into()))
+                                    .unwrap();
+                                continue 'ev_loop;
+                            }
                             if proxy_map.contains_key(&port) {
                                 response_channel
                                     .send(Err(ProxyManager::PROXY_ALREADY_STARTED.into()))
@@ -57,24 +73,39 @@ impl ProxyManager {
                                     port,
                                     Proxy::new(&host, port, &remote_addr, close_sender),
                                 );
-                                tokio::spawn(async move {
-                                    while let Ok(port) = close_receiver.try_recv() {
-                                        request_sender
-                                            .send(Request::DeleteProxy(port, None))
-                                            .await
-                                            .map_err(|_| ProxyManager::REQUEST_ERROR)
-                                            .unwrap();
-                                    }
-                                });
+                                watcher_map.insert(
+                                    port,
+                                    tokio::spawn(async move {
+                                        if let Ok(port) = close_receiver.try_recv() {
+                                            request_sender
+                                                .send(Request::DeleteProxy(port, None))
+                                                .await
+                                                .map_err(|_| ProxyManager::REQUEST_ERROR)
+                                                .unwrap();
+                                        }
+                                    }),
+                                );
                             }
                         }
-                        Request::DeleteProxy(port, res_maybe) => {
+                        Request::DeleteProxy(port, response_maybe) => {
                             proxy_map.remove(&port);
-                            if let Some(res) = res_maybe {
-                                res.send(Ok(())).ok();
+                            if let Some(handle) = watcher_map.remove(&port) {
+                                handle.abort();
+                            }
+                            if let Some(response) = response_maybe {
+                                response.send(Ok(())).ok();
                             }
                         }
                         Request::Terminate => {
+                            terminating = true;
+                            let request_sender = req_sender.clone();
+                            for (port, _) in &proxy_map {
+                                request_sender
+                                    .send(Request::DeleteProxy(*port, None))
+                                    .await
+                                    .map_err(|_| ProxyManager::REQUEST_ERROR)
+                                    .unwrap();
+                            }
                             receiver.close();
                         }
                     };
@@ -84,12 +115,16 @@ impl ProxyManager {
         }
     }
 
+    /// Check if the proxy manager is currently functioning.
+    ///
+    /// Returns true if ok, false if the manager is shut down.
     pub async fn ready(&self) -> bool {
         let receiver = self.ready_watcher.clone();
         let res = *receiver.borrow();
         res
     }
 
+    /// Wait for the proxy manager to be ready.
     pub async fn wait_for_ready(&self) {
         let mut receiver = self.ready_watcher.clone();
         let ready = *receiver.borrow_and_update();
@@ -103,6 +138,11 @@ impl ProxyManager {
         }
     }
 
+    /// Check if the specified proxy is ready.
+    ///
+    /// - port: the port on which the proxy is meant to listen.
+    ///
+    /// Returns true if the proxy is active, false otherwise.
     pub async fn proxy_ready(&self, port: i32) -> bool {
         let (res_sender, res_receiver) = oneshot::channel();
         self.send_request(Request::ProxyStatus(port, res_sender))
@@ -114,6 +154,14 @@ impl ProxyManager {
         }
     }
 
+    /// Create a proxy listening on a port and connecting to a remote address.
+    ///
+    /// - host: the host from which the proxy should accept the requests. e.g. "127.0.0.1" for only
+    /// accepting requests from the localhost.
+    /// - port: the local port on which the proxy should listen.
+    /// - remote_addr: the complete address of the remote service. e.g. google.com:80
+    ///
+    /// Returns Ok if the proxy is successfully created.
     pub async fn create_proxy(
         &self,
         host: String,
@@ -128,9 +176,18 @@ impl ProxyManager {
             response_channel: res_sender,
         })
         .await;
-        Ok(self.wait_for_response(res_receiver).await??)
+        match self.wait_for_response(res_receiver).await? {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.delete_proxy(port).await.ok();
+                Err(e)
+            }
+        }
     }
 
+    /// Delete a proxy.
+    ///
+    /// Returns Ok if the proxy is not found or successfully deleted.
     pub async fn delete_proxy(&self, port: i32) -> Result<(), Error> {
         let (res_sender, res_receiver) = oneshot::channel();
         self.send_request(Request::DeleteProxy(port, Some(res_sender)))

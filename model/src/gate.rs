@@ -14,7 +14,7 @@ pub struct Model {
     pub host: String,
     pub port: i32,
     #[sea_orm(ignore)]
-    pub status: Status,
+    pub ready: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -36,15 +36,3 @@ impl Related<super::service::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Status {
-    InActive,
-    Active,
-}
-
-impl Default for Status {
-    fn default() -> Self {
-        Self::InActive
-    }
-}
