@@ -1,0 +1,20 @@
+[package]
+name = "db"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+sqlx = { version = "0.5", features = [
+    "runtime-tokio-native-tls",
+    "sqlite",
+    "migrate",
+    "chrono",
+    "time",
+] }
+
+# patch sqlx for cross-compilation
+[dependencies.openssl]
+version = "*"
+features = ["vendored"]
